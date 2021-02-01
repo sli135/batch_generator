@@ -1,6 +1,6 @@
 #!/usr/bin/python
 import numpy as np
-import csv
+import csv,os.path
 import matplotlib as mpl
 mpl.use('Agg') 
 mpl.rcParams['agg.path.chunksize'] = 10000
@@ -14,7 +14,7 @@ tf.compat.v1.disable_eager_execution()
 tf.__version__
 
 from tensorflow.keras.regularizers import l2
-from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.models import Model, Sequential, load_model
 from tensorflow.keras.layers import Embedding, SeparableConv1D,MaxPooling2D, Dropout
 from tensorflow.keras.layers import Input, Dense, Reshape, Flatten, Add, Convolution2D, Conv2D, Conv2DTranspose, multiply, LeakyReLU, concatenate
 from tensorflow.keras.optimizers import Adam
@@ -98,13 +98,14 @@ def wasserstein_loss(y_true, y_pred):
 
 
 def gradient_penalty_loss(y_true, y_pred, averaged_samples,
-                          gradient_penalty_weight):
+                          gradient_penalty_weight,sample_weight=None):
     # first get the gradients:
     #   assuming: - that y_pred has dimensions (batch_size, 1)
     #             - averaged_samples has dimensions (batch_size, nbr_features)
     # gradients afterwards has dimension (batch_size, nbr_features), basically
     # a list of nbr_features-dimensional gradient vectors 
     ## tf.gradients is not supported when eager execution is enabled. Use tf.GradientTape instead.
+    print('averaged_samples',averaged_samples)
     gradients = K.gradients(y_pred, averaged_samples)[0]
     print('gradients',gradients)
     #with tf.GradientTape() as g:
@@ -133,8 +134,12 @@ def DenselyConnectedSepConv(z, nfilter, **kwargs):
 
 def make_constrainer(train_energy):
     print(train_energy)
+    if train_energy:
+        name = 'con_e'
+    else:
+        name = 'con_p'
     input_shape = (74, 350, 1)
-    model = Sequential()
+    model = Sequential(name = name)
     model.add(Conv2D(16, (5, 5), padding = 'same',input_shape = input_shape,
         kernel_regularizer=l2(5e-3)))
     model.add(MaxPooling2D(pool_size=(2, 3), strides=None, padding='valid', data_format=None))
@@ -155,13 +160,12 @@ def make_constrainer(train_energy):
         model.add(Dense(1))
     else:
         model.add(Dense(3))
-    opt_c = Adam(2e-6,beta_1 = 0.5,beta_2 = 0.9, decay= 0.0)
-    model.compile(optimizer = opt_c,loss = 'mean_squared_error')
-    model.summary()
+    #model.summary()
     return model
 def make_discriminator():
+    name = 'discriminator'
     input_shape = (74, 350, 1)
-    model = Sequential()
+    model = Sequential(name = name)
     model.add(Conv2D(16, (5, 5), padding = 'same', input_shape = input_shape)) # , input_shape = (74,100,1)
     model.add(LeakyReLU())
     model.add(Conv2D(64, (5, 5), kernel_initializer='he_normal', padding='same'))
@@ -182,11 +186,11 @@ def make_discriminator():
     #####################################################
     model.add(Flatten())
     model.add(Dense(1,kernel_initializer='he_normal',name = 'discriminator_output'))
-    model.summary()
+    #model.summary()
     
     return model
 def regression_loss(y_true,y_pred,
-                          label,k):
+                          label,k,sample_weight=None):
     #k = 0.01
     print('y_pred',y_pred.shape)
     print('label',label.shape)
@@ -196,6 +200,7 @@ def regression_loss(y_true,y_pred,
     e_gen = tf.reduce_mean((label - y_pred[BATCH_SIZE:]) ** 2)
     return k * K.abs(e_real - e_gen)
 def make_generator():
+    name = 'generator'
     model = Sequential()
     model.add(Dense(5*11*16, input_dim=100))
     model.add(LeakyReLU())
@@ -228,18 +233,25 @@ def make_generator():
     model.add(Conv2D(128, (5, 5), padding='same'))
     model.add(LeakyReLU())
     model.add(Conv2D(1, (1,1), padding='same'))
-    model.summary()
+    #model.summary()
     noise = Input(shape=(100,),name = 'noise')
     label = Input(shape=(4,), name = 'label')
     model_input = make_auxiliary_classifier(label,noise)
     
     image = model(model_input)
-    return Model(inputs = [label,noise], outputs = [image])
-def save_models(save_model_path,name,generator,discriminator,constrainer_e,constrainer_p):
+    return Model(inputs = [label,noise], outputs = [image],name = name)
+def save_models(save_model_path,name,generator,discriminator,constrainer_e,constrainer_p,generator_model,discriminator_model):
     generator.save(save_model_path + 'model_generator_'+name+'.h5')
     discriminator.save(save_model_path + 'model_discriminator_'+name+'.h5')
     constrainer_e.save(save_model_path + 'model_constrainer_e_'+name+'.h5')#,include_optimizer = False)
     constrainer_p.save(save_model_path + 'model_constrainer_p_'+name+'.h5')#,include_optimizer = False)
+    generator_model.save(save_model_path + 'model_train_generator_'+name+'.h5')
+    discriminator_model.save(save_model_path + 'model_train_discriminator_'+name+'.h5')
+
+    constrainer_e.save_weights(save_model_path + 'weights_constrainer_e_'+name+'.h5')
+    constrainer_p.save_weights(save_model_path + 'weights_constrainer_p_'+name+'.h5')
+    generator_model.save_weights(save_model_path + 'weights_train_generator_'+name+'.h5')
+    discriminator_model.save_weights(save_model_path + 'weights_train_discriminator_'+name+'.h5')
 
 def save_weights(save_model_path,name,generator_model,discriminator_model,constrainer_e,constrainer_p):
     symbolic_weights = getattr(generator_model.optimizer, 'weights')
@@ -258,34 +270,77 @@ def save_weights(save_model_path,name,generator_model,discriminator_model,constr
     weight_values = K.batch_get_value(symbolic_weights)
     with open(save_model_path + 'model_constrainer_p_weights_'+name+'.pkl', 'wb') as f:
         pickle.dump(weight_values, f,pickle.HIGHEST_PROTOCOL)
+def load_models(save_model_path,name):
+    print("************************** Load Models. *******************************")
+    discriminator = load_model(save_model_path + 'model_discriminator_'+name+'.h5')
+    generator = load_model(save_model_path + 'model_generator_'+name+'.h5')
+
+    generator_input_label = Input(shape=(4,))
+
+    real_samples = Input(shape=(74,350,1))
+    critic_input_label = Input(shape=(4,))
+    print('real_samples: ',real_samples)
+    generator_input_noise_for_discriminator = Input(shape=(100,))
+    generator_input_for_discriminator = [critic_input_label,generator_input_noise_for_discriminator]
+    generated_samples_for_discriminator = generator(generator_input_for_discriminator)
+    averaged_samples = RandomWeightedAverage()([real_samples,
+                                                generated_samples_for_discriminator])
+    print(averaged_samples)
+    constrainer_e = load_model(save_model_path + 'model_constrainer_e_'+name+'.h5')
+    constrainer_p = load_model(save_model_path + 'model_constrainer_p_'+name+'.h5')
+    #constrainer_e.summary()
+    #constrainer_p.summary()
+    generator_model = load_model(save_model_path + 'model_train_generator_'+name+'.h5',
+                        compile=False,
+                        custom_objects={'wasserstein_loss':wasserstein_loss,
+                                        'regression_e':partial(regression_loss,
+                                                                label=generator_input_label[:,3:4],
+                                                                k = 1e-4 *10 * 16 * 2 * 2),
+                                        'regression_p':partial(regression_loss,label = generator_input_label[:,:3],
+                                       k = 1e-2* 10 * 16 * 2)})
+    #generator_model.summary()
+    discriminator_model = load_model(save_model_path + 'model_train_discriminator_'+name+'.h5',
+                        compile=False,
+                        custom_objects={'wasserstein_loss':wasserstein_loss,
+                                        'RandomWeightedAverage':RandomWeightedAverage,
+                                        'gradient_penalty':partial(gradient_penalty_loss,
+                                                            gradient_penalty_weight = GRADIENT_PENALTY_WEIGHT,
+                                                            averaged_samples = averaged_samples)})
+    #discriminator_model.summary()
+    return generator_model,discriminator_model,constrainer_e,constrainer_p
 def save_loss(critic,dis,con_e,con_p,epoch):
     csv_path = '/gpfs/slac/staas/fs1/g/g.exo/shaolei/GAN_loss/'
-    with open(csv_path + 'critic_loss_constrain_'+str(epoch)+'.csv', mode='w') as csv_file:
+    mode = 'w'
+    write_header = True
+    if os.path.isfile(csv_path + 'critic_loss_constrain_'+str(epoch)+'.csv'):
+        mode = 'a'
+        write_header = False
+    with open(csv_path + 'critic_loss_constrain_'+str(epoch)+'.csv', mode=mode) as csv_file:
         fieldnames = ['loss', 'wasserstein1', 'wasserstein2','gradient_penalty']
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         for row in critic:
             writer.writerow({'loss': row[0], 'wasserstein1': row[1], 'wasserstein2': row[2], 'gradient_penalty':row[3]})
-    with open(csv_path + 'generator_loss_constrain_'+str(epoch)+'.csv', mode='w') as csv_file:
+    with open(csv_path + 'generator_loss_constrain_'+str(epoch)+'.csv', mode=mode) as csv_file:
         fieldnames = ['loss', 'discriminator_output_loss', 'constrainer_e_loss','constrainer_p_loss']
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         for row in dis:
             writer.writerow({'loss': row[0], 'discriminator_output_loss': row[1], 'constrainer_e_loss': row[2], 'constrainer_p_loss':row[3]})
-    with open(csv_path + 'constrainer_e_loss_constrain_'+str(epoch)+'.csv', mode='w') as csv_file:
+    with open(csv_path + 'constrainer_e_loss_constrain_'+str(epoch)+'.csv', mode=mode) as csv_file:
         fieldnames = ['loss']
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         for row in con_e:
             writer.writerow({'loss': row})
-    with open(csv_path + 'constrainer_p_loss_constrain_'+str(epoch)+'.csv', mode='w') as csv_file:
+    with open(csv_path + 'constrainer_p_loss_constrain_'+str(epoch)+'.csv', mode=mode) as csv_file:
         fieldnames = ['loss']
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         for row in con_p:
             writer.writerow({'loss': row})
 def read_data(filename):
@@ -304,7 +359,22 @@ def read_data(filename):
             count += 1
     print(filename + " has %i events" % count)
     return np.asarray(features), np.asarray(labels)
-def train(Epochs):
+def load_opt_weights(save_model_path,name):
+    with open(save_model_path + 'model_constrainer_e_weights_'+name+'.pkl', 'rb') as f:
+        opt_w_ce = pickle.load(f)
+    with open(save_model_path + 'model_constrainer_p_weights_'+name+'.pkl', 'rb') as f:
+        opt_w_cp = pickle.load(f)
+    with open(save_model_path + 'model_generator_weights_'+name+'.pkl', 'rb') as f:
+        opt_w_g = pickle.load(f)
+    with open(save_model_path + 'model_discriminator_weights_'+name+'.pkl', 'rb') as f:
+        opt_w_d = pickle.load(f)
+    return opt_w_g,opt_w_d,opt_w_ce,opt_w_cp
+def print_weights(model):
+    print("#-------------------print G() weights--------------------------#")
+    for layer in model.layers:
+        print(layer.get_weights())
+    print("#--------------------------------------------------------------#")
+def train(Epochs,save_name):
     print('Start training. Epochs:',Epochs)
     data_path = "/gpfs/slac/staas/fs1/g/g.exo-userdata/users/shaolei/"
     save_model_path = '/gpfs/slac/staas/fs1/g/g.exo/shaolei/GAN_reweight_models/'
@@ -321,11 +391,6 @@ def train(Epochs):
     constrainer_p = make_constrainer(train_energy = False)
     constrainer_e = make_constrainer(train_energy = True)
 
-    ############Pre train constrainers ########################
-
-    constrainer_e.fit_generator(generator=train_e_batch_generator,epochs = 3,verbose = 1) #sample_weight=e_charge_weight
-    constrainer_p.fit_generator(generator=train_p_batch_generator,epochs = 3,verbose = 1) #sample_weight=pos_weight
-    
     ############################################################
     
     discriminator = make_discriminator()
@@ -334,15 +399,7 @@ def train(Epochs):
     opt_g = Adam(1e-4,beta_1 = 0.5,beta_2 = 0.9, decay= 0)
     
     ############ Make D() and G() for training ###################
-    for layer in discriminator.layers:
-        layer.trainable = False
-    discriminator.trainable = False
-    for layer in constrainer_e.layers:
-        layer.trainable = False
-    constrainer_e.trainable = False
-    for layer in constrainer_p.layers:
-        layer.trainable = False
-    constrainer_p.trainable = False
+
     generator_input_noise = Input(shape=(100,))
     generator_input_label = Input(shape=(4,))
     generator_input = [generator_input_label,generator_input_noise]
@@ -361,34 +418,35 @@ def train(Epochs):
     g_and_r_out_p = constrainer_p(g_and_r)
     partial_regression_loss_p = partial(regression_loss,
                                        label = generator_input_label[:,:3],
-                                       k = 1e-2* 10 * 16 * 2)
+                                       k = 3.2)
     g_and_r_out_e = constrainer_e(g_and_r)
     partial_regression_loss_e = partial(regression_loss,
                                      label=generator_input_label[:,3:4],
-                                       k = 1e-4 *10 * 16 * 2 * 2)
+                                       k = 0.064)
     # Functions need names or Keras will throw an error
     partial_regression_loss_e.__name__ = 'regression_e'
     partial_regression_loss_p.__name__ = 'regression_p'
 
     g_and_r_out_e = tf.keras.layers.Lambda(lambda x: x, name='constrainer_e')(g_and_r_out_e)
     g_and_r_out_p = tf.keras.layers.Lambda(lambda x: x, name='constrainer_p')(g_and_r_out_p)
-                                                
+
+    discriminator.trainable = False
+    constrainer_e.trainable = False
+    constrainer_p.trainable = False                                            
     generator_model = Model(inputs=[generator_input_label,
                                     generator_input_noise,
                                     real_samples_constrainer],
                             outputs=[discriminator_layers_for_generator,
                                      g_and_r_out_e,
                                      g_and_r_out_p])
-    #generator_model.compile(optimizer = opt_g, loss = {'discriminator_output':wasserstein_loss})
     generator_model.compile(optimizer = opt_g, loss = [wasserstein_loss, 
                                                        partial_regression_loss_e,
                                                        partial_regression_loss_p])
     generator_model.metrics_names
+    generator_model._make_train_function()
+    print("G() weights",len(generator_model.optimizer.get_weights()))
     ################################ Discriminator model ############################
-    for layer in discriminator.layers:
-        layer.trainable = True
-    for layer in generator.layers:
-        layer.trainable = False
+    
     discriminator.trainable = True
     generator.trainable = False
     real_samples = Input(shape=(74, 350, 1))
@@ -402,10 +460,11 @@ def train(Epochs):
     print('discriminator_output_from_generator: ',generated_samples_for_discriminator.shape)
     discriminator_output_from_real_samples = tf.keras.layers.Lambda(lambda x: x, name='real_samples_output')(discriminator(real_samples))
 
-    averaged_samples = RandomWeightedAverage()([real_samples,
-                                                generated_samples_for_discriminator])
-
+    averaged_samples = tf.keras.layers.Lambda(lambda x: x, name='averaged_samples')(RandomWeightedAverage()([real_samples,
+                                                generated_samples_for_discriminator]))
+    print('discriminator(averaged_samples)',discriminator(averaged_samples))
     averaged_samples_out = tf.keras.layers.Lambda(lambda x: x, name='averaged_output')(discriminator(averaged_samples))
+    print('averaged_samples_out',averaged_samples_out)
     partial_gp_loss = partial(gradient_penalty_loss,
                               averaged_samples=averaged_samples,
                               gradient_penalty_weight=GRADIENT_PENALTY_WEIGHT)
@@ -422,23 +481,27 @@ def train(Epochs):
                                          averaged_samples_out])
     discriminator_model.compile(optimizer=opt_d, loss=[wasserstein_loss, wasserstein_loss, partial_gp_loss])
     discriminator_model.metrics_names
-
-
-    for layer in constrainer_e.layers:
-        layer.trainable = True
     constrainer_e.trainable = True
-    for layer in constrainer_p.layers:
-        layer.trainable = True
     constrainer_p.trainable = True
+    #generator_model.summary()
+    #discriminator_model.summary()
+    #constrainer_e.summary()
+    #constrainer_p.summary()
 
-    critic = []
-    dis = []
-    con_p,con_e = [],[]
-    eval_critic = []
+    opt_c = Adam(2e-6,beta_1 = 0.5,beta_2 = 0.9, decay= 0.0)
+    constrainer_e.compile(optimizer = opt_c,loss = 'mean_squared_error')
+    constrainer_p.compile(optimizer = opt_c,loss = 'mean_squared_error')
+
+    ############Pre train constrainers ########################
+
+    constrainer_e.fit_generator(generator=train_e_batch_generator,epochs = 1,verbose = 1) #sample_weight=e_charge_weight
+    constrainer_p.fit_generator(generator=train_p_batch_generator,epochs = 1,verbose = 1) #sample_weight=pos_weight
+
     ################################### Training #####################################
     start = 0
-    iterations = train_e_batch_generator.__len__()
+    iterations = train_batch_generator.__len__()
     indices = np.array([i for i in range(iterations - 1)])
+    
     for epoch in range(start,start+Epochs):
 
         print("Epoch: ", epoch)
@@ -449,7 +512,7 @@ def train(Epochs):
         constrainer_loss_p = []
         minibatches_size = BATCH_SIZE * TRAINING_RATIO
         np.random.shuffle(indices)
-        print(indices)
+        #print(indices)
         for i in range(iterations // TRAINING_RATIO):
             if i % 100 == 0: print('Minibatch %i processed.' %i,)
             minibatches = indices[i:i+5]
@@ -472,15 +535,188 @@ def train(Epochs):
                                                                   np.random.rand(batch_size,100),
                                                                   image_batch],
                                                                 [positive_y,dummy_y,dummy_y]))
-        critic += discriminator_loss
-        dis += generator_loss
-        con_e += constrainer_loss_e
-        con_p += constrainer_loss_p
-        save_loss(critic,dis,con_e,con_p,"gen-wTh"+str(iterations))
-        save_models(save_model_path,"gen-wTh"+str(iterations),generator,discriminator,constrainer_e,constrainer_p)
-        save_weights(save_model_path,"gen-wTh"+str(iterations),generator_model,discriminator_model,constrainer_e,constrainer_p)
-    
+
+        save_loss(discriminator_loss,generator_loss,constrainer_loss_e,constrainer_loss_p,save_name)
+        save_models(save_model_path,save_name,generator,discriminator,constrainer_e,constrainer_p,generator_model,discriminator_model)
+        save_weights(save_model_path,save_name,generator_model,discriminator_model,constrainer_e,constrainer_p)
+    print("CE() opt",len(constrainer_e.optimizer.get_weights()))
+    print("CP() opt",len(constrainer_p.optimizer.get_weights()))
+    print("G() opt",len(generator_model.optimizer.get_weights()))
+    print("D() opt",len(discriminator_model.optimizer.get_weights()))
+def continue_train(save_name,Epochs):
+    print('#------------------Continue training. Epochs:',Epochs,'-----------------------#')
+    data_path = "/gpfs/slac/staas/fs1/g/g.exo-userdata/users/shaolei/"
+    save_model_path = '/gpfs/slac/staas/fs1/g/g.exo/shaolei/GAN_reweight_models/'
+    ################ batch generator ##############################
+    X_train,Y_train = bg.load_data("train_files/filenames_set2.npy","train_files/labels_set2_train.npy")
+    X_e_train,Y_e_train = bg.load_data("train_files/filenames_train.npy","train_files/labels_e_train.npy")
+    X_p_train,Y_p_train = bg.load_data("train_files/filenames_train.npy","train_files/labels_p_train.npy")
+    train_batch_generator = bg.Batch_Generator(X_train,Y_train, BATCH_SIZE)
+    train_e_batch_generator = bg.Batch_Generator(X_e_train,Y_e_train, BATCH_SIZE)
+    train_p_batch_generator = bg.Batch_Generator(X_p_train,Y_p_train, BATCH_SIZE)
+    generator_model,discriminator_model,constrainer_e,constrainer_p = load_models(save_model_path,save_name)
+    opt_w_g,opt_w_d,opt_w_ce,opt_w_cp = load_opt_weights(save_model_path,save_name)
+    discriminator = discriminator_model.get_layer('discriminator')
+    generator = generator_model.get_layer('generator')
+    opt_d = Adam(1e-4,beta_1 = 0.5,beta_2 = 0.9, decay= 0)
+    opt_g = Adam(1e-4,beta_1 = 0.5,beta_2 = 0.9, decay= 0)
+    ############################## re compile G() ###############################
+    generator_input_noise = Input(shape=(100,))
+    generator_input_label = Input(shape=(4,))
+    generator_input = [generator_input_label,generator_input_noise]
+    generator_layers = generator(generator_input)
+    discriminator_input = generator_layers
+    name_layer = tf.keras.layers.Lambda(lambda x: x, name='discriminator_output')
+    discriminator_layers_for_generator = name_layer(discriminator(discriminator_input))
+
+    # This is the constrainer output
+    name_layer_2 = tf.keras.layers.Lambda(lambda x: x, name='constrainer_output')
+
+    real_samples_constrainer = Input(shape=(74, 350, 1)) #shape=X_train.shape[1:])
+
+    g_and_r = concatenate([real_samples_constrainer,generator_layers],axis = 0)
+
+    g_and_r_out_p = constrainer_p(g_and_r)
+    partial_regression_loss_p = partial(regression_loss,
+                                       label = generator_input_label[:,:3],
+                                       k = 3.2)
+    g_and_r_out_e = constrainer_e(g_and_r)
+    partial_regression_loss_e = partial(regression_loss,
+                                     label=generator_input_label[:,3:4],
+                                       k = 0.064 * 2)
+    # Functions need names or Keras will throw an error
+    partial_regression_loss_e.__name__ = 'regression_e'
+    partial_regression_loss_p.__name__ = 'regression_p'
+
+    g_and_r_out_e = tf.keras.layers.Lambda(lambda x: x, name='constrainer_e')(g_and_r_out_e)
+    g_and_r_out_p = tf.keras.layers.Lambda(lambda x: x, name='constrainer_p')(g_and_r_out_p)
+
+    discriminator.trainable = False
+    constrainer_e.trainable = False
+    constrainer_p.trainable = False 
+    generator.trainable = True                                           
+    generator_model = Model(inputs=[generator_input_label,
+                                    generator_input_noise,
+                                    real_samples_constrainer],
+                            outputs=[discriminator_layers_for_generator,
+                                     g_and_r_out_e,
+                                     g_and_r_out_p])
+    generator_model.compile(optimizer = opt_g, loss = [wasserstein_loss, 
+                                                       partial_regression_loss_e,
+                                                       partial_regression_loss_p])
+    generator_model.load_weights(save_model_path + 'weights_train_generator_'+save_name+'.h5')
+    generator_model._make_train_function()
+    print("G() weights",len(generator_model.optimizer.get_weights()))
+    generator_model.optimizer.set_weights(opt_w_g)
+    #print_weights(generator_model)
+    ############################## re compile D() ###############################
+    discriminator.trainable = True
+    generator.trainable = False
+    real_samples = Input(shape=(74, 350, 1))
+    critic_input_label = Input(shape=(4,))
+    print('real_samples: ',real_samples)
+    generator_input_noise_for_discriminator = Input(shape=(100,))
+    generator_input_for_discriminator = [critic_input_label,generator_input_noise_for_discriminator]
+    generated_samples_for_discriminator = generator(generator_input_for_discriminator)
+    print('generated_samples_for_discriminator: ',generated_samples_for_discriminator)
+    discriminator_output_from_generator = tf.keras.layers.Lambda(lambda x: x, name='gen_pred_output')(discriminator(generated_samples_for_discriminator))
+    print('discriminator_output_from_generator: ',generated_samples_for_discriminator.shape)
+    discriminator_output_from_real_samples = tf.keras.layers.Lambda(lambda x: x, name='real_samples_output')(discriminator(real_samples))
+
+    averaged_samples = tf.keras.layers.Lambda(lambda x: x, name='averaged_samples')(RandomWeightedAverage()([real_samples,
+                                                generated_samples_for_discriminator]))
+    print('discriminator(averaged_samples)',discriminator(averaged_samples))
+    averaged_samples_out = tf.keras.layers.Lambda(lambda x: x, name='averaged_output')(discriminator(averaged_samples))
+    print('averaged_samples_out',averaged_samples_out)
+    partial_gp_loss = partial(gradient_penalty_loss,
+                              averaged_samples=averaged_samples,
+                              gradient_penalty_weight=GRADIENT_PENALTY_WEIGHT)
+
+    #constrainer_output_from_generator = tf.keras.layers.Lambda(lambda x: x, name='constrainer_output')(constrainer_e(generated_samples_for_discriminator))
+    # Functions need names or Keras will throw an error
+    partial_gp_loss.__name__ = 'gradient_penalty'
+
+    discriminator_model = Model(inputs=[real_samples,
+                                        critic_input_label,
+                                        generator_input_noise_for_discriminator],
+                                outputs=[discriminator_output_from_real_samples,
+                                         discriminator_output_from_generator,
+                                         averaged_samples_out])
+    discriminator_model.compile(optimizer=opt_d, loss=[wasserstein_loss, wasserstein_loss, partial_gp_loss])
+    discriminator_model.load_weights(save_model_path + 'weights_train_discriminator_'+save_name+'.h5')
+    discriminator_model._make_train_function()
+    print('D() weights',len(discriminator_model.optimizer.get_weights()))
+    discriminator_model.optimizer.set_weights(opt_w_d)
+    ################################### recompile CE() CP() ##########################
+    constrainer_e.trainable = True
+    constrainer_p.trainable = True
+    opt_c = Adam(2e-6,beta_1 = 0.5,beta_2 = 0.9, decay= 0.0)
+    constrainer_e.compile(optimizer = opt_c,loss = 'mean_squared_error')
+    constrainer_p.compile(optimizer = opt_c,loss = 'mean_squared_error')
+    constrainer_e.load_weights(save_model_path + 'weights_constrainer_e_'+save_name+'.h5')
+    constrainer_p.load_weights(save_model_path + 'weights_constrainer_p_'+save_name+'.h5')
+
+    constrainer_e._make_train_function()
+    constrainer_p._make_train_function()
+    constrainer_e.optimizer.set_weights(opt_w_ce)
+    constrainer_p.optimizer.set_weights(opt_w_cp)
+    ################################### Training #####################################
+    #generator_model.summary()
+    #discriminator_model.summary()
+    #constrainer_e.summary()
+    #constrainer_p.summary()
+
+    start = 0
+    iterations = train_batch_generator.__len__()
+    indices = np.array([i for i in range(iterations - 1)])
+    for epoch in range(start,start+Epochs):
+
+        print("Epoch: ", epoch)
+        print("Number of batches: ", iterations)
+        discriminator_loss = []
+        generator_loss = []
+        constrainer_loss_e = []
+        constrainer_loss_p = []
+        minibatches_size = BATCH_SIZE * TRAINING_RATIO
+        np.random.shuffle(indices)
+        #print(indices)
+        for i in range(iterations // TRAINING_RATIO):
+            if i % 100 == 0: print('Minibatch %i processed.' %i,)
+            minibatches = indices[i:i+5]
+            for j in range(TRAINING_RATIO):
+                image_batch,label_batch = train_batch_generator.__getitem__(minibatches[j])
+                batch_size = image_batch.shape[0]
+                noise = np.random.rand(batch_size, 100).astype(np.float32)
+                positive_y = np.ones((batch_size, 1), dtype=np.float32)
+                negative_y = -positive_y
+                dummy_y = np.zeros((batch_size, 1), dtype=np.float32)
+                discriminator_loss.append(discriminator_model.train_on_batch(
+                    [image_batch,label_batch, noise],
+                    [positive_y, negative_y, dummy_y]))
+            #Maybe training constrainer with generator
+            constrainer_loss_e.append(constrainer_e.train_on_batch([image_batch],
+                                                                         [label_batch[:,3]])) 
+            constrainer_loss_p.append(constrainer_p.train_on_batch([image_batch],
+                                                                         [label_batch[:,:3]])) #,sample_weight=weight_batch
+            generator_loss.append(generator_model.train_on_batch([label_batch,
+                                                                  np.random.rand(batch_size,100),
+                                                                  image_batch],
+                                                                [positive_y,
+                                                                dummy_y,
+                                                                dummy_y]))
+
+        save_loss(discriminator_loss,generator_loss,constrainer_loss_e,constrainer_loss_p,save_name)
+        save_models(save_model_path,save_name,generator,discriminator,constrainer_e,constrainer_p,generator_model,discriminator_model)
+        save_weights(save_model_path,save_name,generator_model,discriminator_model,constrainer_e,constrainer_p)
+    #print(len(generator_model.optimizer.get_weights()))
+    #print(len(discriminator_model.optimizer.get_weights()))
 if __name__ == "__main__":
-    train(100)
+    print("tensorflow version is", tf.__version__)
+    print("keras version is", tf.keras.__version__)
+    save_name = "flatten"#"reload5"
+    print("#---------------------Training: ",save_name,"-----------------------#")
+    train(100,save_name)
+    #continue_train(save_name,2)
+
 
 
