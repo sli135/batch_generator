@@ -330,19 +330,19 @@ def save_loss(critic,dis,con_e,con_p,epoch):
         for row in dis:
             writer.writerow({'loss': row[0], 'discriminator_output_loss': row[1], 'constrainer_e_loss': row[2], 'constrainer_p_loss':row[3]})
     with open(csv_path + 'constrainer_e_loss_constrain_'+str(epoch)+'.csv', mode=mode) as csv_file:
-        fieldnames = ['loss']
+        fieldnames = ['loss','val']
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
         for row in con_e:
-            writer.writerow({'loss': row})
+            writer.writerow({'loss': row[0], 'val':row[1]})
     with open(csv_path + 'constrainer_p_loss_constrain_'+str(epoch)+'.csv', mode=mode) as csv_file:
-        fieldnames = ['loss']
+        fieldnames = ['loss','val']
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
         for row in con_p:
-            writer.writerow({'loss': row})
+            writer.writerow({'loss': row[0], 'val':row[1]})
 def read_data(filename):
     nLabels = 4
     nFeatures = 74*350
@@ -385,6 +385,9 @@ def train(Epochs,save_name):
     train_batch_generator = bg.Batch_Generator(X_train,Y_train, BATCH_SIZE)
     train_e_batch_generator = bg.Batch_Generator(X_e_train,Y_e_train, BATCH_SIZE)
     train_p_batch_generator = bg.Batch_Generator(X_p_train,Y_p_train, BATCH_SIZE)
+
+    X_test,Y_test = bg.load_data("train_files/filenames_Ra.npy","train_files/labels_Ra.npy") # labels_test
+    val_batch_generator = bg.Batch_Generator(X_test,Y_test, BATCH_SIZE)
     #val_e_batch_generator = Batch_Generator("filenames_test.npy","labels_e_test.npy", BATCH_SIZE)
     #val_p_batch_generator = Batch_Generator("filenames_test.npy","labels_p_test.npy", BATCH_SIZE)
     ############Make constrainers ########################
@@ -418,11 +421,11 @@ def train(Epochs,save_name):
     g_and_r_out_p = constrainer_p(g_and_r)
     partial_regression_loss_p = partial(regression_loss,
                                        label = generator_input_label[:,:3],
-                                       k = 3.2)
+                                       k = 1) #3.2 .032
     g_and_r_out_e = constrainer_e(g_and_r)
     partial_regression_loss_e = partial(regression_loss,
                                      label=generator_input_label[:,3:4],
-                                       k = 0.064)
+                                       k = 1) # 0.064
     # Functions need names or Keras will throw an error
     partial_regression_loss_e.__name__ = 'regression_e'
     partial_regression_loss_p.__name__ = 'regression_p'
@@ -502,6 +505,7 @@ def train(Epochs,save_name):
     iterations = train_batch_generator.__len__()
     indices = np.array([i for i in range(iterations - 1)])
     
+    val_ids = val_batch_generator.__len__() - 1
     for epoch in range(start,start+Epochs):
 
         print("Epoch: ", epoch)
@@ -510,6 +514,7 @@ def train(Epochs,save_name):
         generator_loss = []
         constrainer_loss_e = []
         constrainer_loss_p = []
+        val_e,val_p = [],[]
         minibatches_size = BATCH_SIZE * TRAINING_RATIO
         np.random.shuffle(indices)
         #print(indices)
@@ -535,7 +540,12 @@ def train(Epochs,save_name):
                                                                   np.random.rand(batch_size,100),
                                                                   image_batch],
                                                                 [positive_y,dummy_y,dummy_y]))
-
+            ID = np.random.randint(val_ids)
+            x_batch,y_batch = val_batch_generator.__getitem__(ID)
+            val_e.append(constrainer_e.test_on_batch([x_batch], [y_batch[:,3] ] ))
+            val_p.append(constrainer_p.test_on_batch([x_batch], [y_batch[:,:3] ] ))
+        constrainer_loss_e = list(zip(constrainer_loss_e,val_e))
+        constrainer_loss_p = list(zip(constrainer_loss_p,val_p))
         save_loss(discriminator_loss,generator_loss,constrainer_loss_e,constrainer_loss_p,save_name)
         save_models(save_model_path,save_name,generator,discriminator,constrainer_e,constrainer_p,generator_model,discriminator_model)
         save_weights(save_model_path,save_name,generator_model,discriminator_model,constrainer_e,constrainer_p)
@@ -548,12 +558,15 @@ def continue_train(save_name,Epochs):
     data_path = "/gpfs/slac/staas/fs1/g/g.exo-userdata/users/shaolei/"
     save_model_path = '/gpfs/slac/staas/fs1/g/g.exo/shaolei/GAN_reweight_models/'
     ################ batch generator ##############################
-    X_train,Y_train = bg.load_data("train_files/filenames_set2.npy","train_files/labels_set2_train.npy")
+    X_train,Y_train = bg.load_data("train_files/filenames_train.npy","train_files/labels_train.npy") #_500-3000
     X_e_train,Y_e_train = bg.load_data("train_files/filenames_train.npy","train_files/labels_e_train.npy")
     X_p_train,Y_p_train = bg.load_data("train_files/filenames_train.npy","train_files/labels_p_train.npy")
     train_batch_generator = bg.Batch_Generator(X_train,Y_train, BATCH_SIZE)
     train_e_batch_generator = bg.Batch_Generator(X_e_train,Y_e_train, BATCH_SIZE)
     train_p_batch_generator = bg.Batch_Generator(X_p_train,Y_p_train, BATCH_SIZE)
+
+    X_test,Y_test = bg.load_data("train_files/filenames_Ra.npy","train_files/labels_Ra.npy")
+    val_batch_generator = bg.Batch_Generator(X_test,Y_test, BATCH_SIZE)
     generator_model,discriminator_model,constrainer_e,constrainer_p = load_models(save_model_path,save_name)
     opt_w_g,opt_w_d,opt_w_ce,opt_w_cp = load_opt_weights(save_model_path,save_name)
     discriminator = discriminator_model.get_layer('discriminator')
@@ -579,11 +592,11 @@ def continue_train(save_name,Epochs):
     g_and_r_out_p = constrainer_p(g_and_r)
     partial_regression_loss_p = partial(regression_loss,
                                        label = generator_input_label[:,:3],
-                                       k = 3.2)
+                                       k = 0.01)
     g_and_r_out_e = constrainer_e(g_and_r)
     partial_regression_loss_e = partial(regression_loss,
                                      label=generator_input_label[:,3:4],
-                                       k = 0.064 * 2)
+                                       k = 0.01 ) #* 2
     # Functions need names or Keras will throw an error
     partial_regression_loss_e.__name__ = 'regression_e'
     partial_regression_loss_p.__name__ = 'regression_p'
@@ -669,6 +682,8 @@ def continue_train(save_name,Epochs):
     start = 0
     iterations = train_batch_generator.__len__()
     indices = np.array([i for i in range(iterations - 1)])
+
+    val_ids = val_batch_generator.__len__() - 1
     for epoch in range(start,start+Epochs):
 
         print("Epoch: ", epoch)
@@ -677,6 +692,7 @@ def continue_train(save_name,Epochs):
         generator_loss = []
         constrainer_loss_e = []
         constrainer_loss_p = []
+        val_e,val_p = [],[]
         minibatches_size = BATCH_SIZE * TRAINING_RATIO
         np.random.shuffle(indices)
         #print(indices)
@@ -704,7 +720,12 @@ def continue_train(save_name,Epochs):
                                                                 [positive_y,
                                                                 dummy_y,
                                                                 dummy_y]))
-
+            ID = np.random.randint(val_ids)
+            x_batch,y_batch = val_batch_generator.__getitem__(ID)
+            val_e.append(constrainer_e.test_on_batch([x_batch], [y_batch[:,3] ] ))
+            val_p.append(constrainer_p.test_on_batch([x_batch], [y_batch[:,:3] ] ))
+        constrainer_loss_e = list(zip(constrainer_loss_e,val_e))
+        constrainer_loss_p = list(zip(constrainer_loss_p,val_p))
         save_loss(discriminator_loss,generator_loss,constrainer_loss_e,constrainer_loss_p,save_name)
         save_models(save_model_path,save_name,generator,discriminator,constrainer_e,constrainer_p,generator_model,discriminator_model)
         save_weights(save_model_path,save_name,generator_model,discriminator_model,constrainer_e,constrainer_p)
@@ -713,10 +734,10 @@ def continue_train(save_name,Epochs):
 if __name__ == "__main__":
     print("tensorflow version is", tf.__version__)
     print("keras version is", tf.keras.__version__)
-    save_name = "flatten"#"reload5"
+    save_name = "flatten2"#"reload5"#
     print("#---------------------Training: ",save_name,"-----------------------#")
-    train(100,save_name)
-    #continue_train(save_name,2)
+    #train(100,save_name)
+    continue_train(save_name,100)
 
 
 
